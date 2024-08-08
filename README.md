@@ -1,5 +1,7 @@
 ## Keeping up to date
 
+GPIO pin for flash is set to 27.
+
 Update repository. Navigate to project folder
 
 ```bash
