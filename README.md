@@ -55,6 +55,7 @@ cd alarm_system
 ```bash
 idf.py build
 ```
+This may take a few minutes the first time.
 
 ### Flash and monitor the board with
 
