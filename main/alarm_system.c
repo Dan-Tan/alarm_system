@@ -19,8 +19,10 @@ void app_main(void)
 
     while (1) {
         gpio_set_level(BLINK_LED, 1);
-        vTaskDelay(1000);
+        ESP_LOGI(taskName, "ON!");
+        vTaskDelay(100);
         gpio_set_level(BLINK_LED, 0);
-        vTaskDelay(1000);
+        ESP_LOGI(taskName, "OFF!");
+        vTaskDelay(100);
     }
 }
