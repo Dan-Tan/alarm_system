@@ -1,3 +1,23 @@
+## SD Card Setup
+
+**Format**
+
+The SD card should be formatted with FAT32. 
+
+**Pins**
+
+MISO: 27
+MOSI: 15
+CLK:  14
+CS:   13
+
+**Directory Structure**
+
+The SD card should contain a config file named `config.txt`. This should contain the name of the audio file stored in the same base directory. The audio file should be in mp3 file format.
+
+```txt
+audio_file_name.mp3
+```
 ## Keeping up to date
 
 GPIO pin for flash is set to 27.
