@@ -58,7 +58,7 @@ static const char *SD_TAG = "SD Card";
 #define I2S_DOUT                33    // Data Out ESP32 (Data In Amp)
 #define I2S_UNUSED              (-1)  // Not used
 
-#define AUDIO_GAIN_PIN #define I2S_PORT_NUM            (0)
+#define I2S_PORT_NUM            (0)
 #define SAMPLE_RATE             44100
 #define PI                      (3.14159265)
 #define WAVE_FREQ_HZ            (400)
@@ -186,13 +186,13 @@ void play_music(void *filepath_v) {
         }
 
         if (frame_info.channels == 1) {
-          for (int i = samples_decoded - 1; i >= 0; i--) {
-            output_buffer[i * 2] = output_buffer[i];
-            output_buffer[i * 2 - 1] = output_buffer[i];
+            for (int i = samples_decoded - 1; i >= 0; i--) {
+                output_buffer[i * 2] = output_buffer[i];
+                output_buffer[i * 2 - 1] = output_buffer[i];
           }
         }
 
-        i2s_set_clk(I2S_PORT_NUM, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, 2);
+        i2s_set_clk(I2S_PORT_NUM, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
 
         i2s_write(I2S_PORT_NUM, output_buffer, samples_decoded * sizeof(short), &i2s_bytes_written, 100);
         if (samples_decoded * sizeof(short) > i2s_bytes_written) {
