@@ -69,7 +69,7 @@ void init_i2s_interface() {
 
 void lower_volume(short* out, int n_samples) {
     for (int i = 0; i < n_samples; i++) {
-        out[i] = out[i] / 8;
+        out[i] = out[i] / 2;
     }
 }
 
@@ -82,6 +82,7 @@ void mono_to_stereo(short* out, int n_samples) {
 
 
 void sine_wave(void* unused) {
+    printf("Playing Sine Wave\n");
 
     short *output_buffer = malloc(8 * 4410 * sizeof(short));
     size_t i2s_bytes_written = 0;

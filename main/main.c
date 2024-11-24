@@ -1,6 +1,4 @@
 #include <stdio.h>
-
-#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <sys/unistd.h>
@@ -10,37 +8,24 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
-// File system includes
-#include "esp_vfs_fat.h"
-
-// SPI interface includes
-#include "driver/sdspi_host.h"
-#include "driver/spi_common.h"
-
 // SD card includes
-#include "freertos/FreeRTOS.h"
-#include "freertos/FreeRTOSConfig.h"
 #include "freertos/portmacro.h"
+#include "freertos/FreeRTOSConfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/projdefs.h"
-#include "sdmmc_cmd.h"
 #include "sdkconfig.h"
-#include "driver/sdmmc_host.h"
+#include "esp_sleep.h"
 
+#include "driver/gpio.h"
+
+#include "ulp_controller.h"
 #include "audio.h"
+#include "storage.h"
 
-static const char *SD_TAG = "SD Card";
+#define GPIO_INPUT_PIN_SEL   (1ULL << GPIO_RTC_SWITCH)
 
-#define MOUNT_POINT            "/sd"
-
-#define CONFIG_FILE            "/config.txt"
-
-// SPI pins for SD card
-#define PIN_NUM_MISO            27    // Master In Slave Out
-#define PIN_NUM_MOSI            15    // Master Out Slave In
-#define PIN_NUM_CLK             14    // Clock
-#define PIN_NUM_CS              13    // Child Select
-
-#define SPI_DMA_CHAN            host.slot
+const char* MAIN_TAG = "MAIN";
 
 bool check_mp3_suffix(char* filename) {
     int counter = 0;
@@ -57,109 +42,102 @@ bool check_mp3_suffix(char* filename) {
         *(filename - 1) == '3';
 }
 
+void check_button_input(void* unused) {
+    printf("Entering check button\n");
+    uint32_t current_lvl = 0;
+    uint32_t prev_lvl = 0;
+    while (1) {
+        current_lvl = gpio_get_level(GPIO_RTC_SWITCH);
+        if ((prev_lvl == 1) && (current_lvl == 0)) {
+            printf("Entering deep sleep\n");
+            esp_sleep_enable_ext0_wakeup(GPIO_RTC_SWITCH, 1);
+            esp_deep_sleep_start();
+        }
+        prev_lvl = current_lvl;
+        vTaskDelay(10);
+    }
+}
+
 void app_main(void)
 {
-#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
-    ESP_LOGI(SD_TAG, "Bland or S2");
-#elif CONFIG_IDF_TARGET_ESP32C3
-    ESP_LOGI(SD_TAG, "C3");
-#endif
+    gpio_config_t io_conf = {};
+    io_conf.intr_type     = GPIO_INTR_DISABLE;
+    io_conf.mode          = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask  = GPIO_INPUT_PIN_SEL;
+    io_conf.pull_down_en  = 0;
+    io_conf.pull_up_en    = 0;
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause != ESP_SLEEP_WAKEUP_ULP) {
+        printf("Not ULP wakeup, initializing ULP\n");
+        init_ulp();
+    } 
+
+    gpio_config(&io_conf);
+    
     esp_err_t ret;
-
-    // SD Card File System Mount options
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false, // Don't format card if failed
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024
-    };
-    sdmmc_card_t *card;
-    const char mount_point[] = MOUNT_POINT;
-    ESP_LOGI(SD_TAG, "Initializing SD card");
-
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
+    ret = set_up_storage();
+    bool has_sd_card = true;
     if (ret != ESP_OK) {
-        ESP_LOGE(SD_TAG, "Failed to initialize bus.");
-        return;
-    }
-
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
-    slot_config.host_id = host.slot;
-
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
-
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(SD_TAG, "Failed to mount filesystem. "
-                    "If you want the card to be formatted, set the EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
-        } else {
-            ESP_LOGE(SD_TAG, "Failed to initialize the card (%s). "
-                    "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-        }
-        return;
-    }
-    ESP_LOGI(SD_TAG, "Filesystem mounted");
-
-    // Card has been initialized, print its properties
-    sdmmc_card_print_info(stdout, card);
-
-    // Use POSIX and C standard library functions to work with files.
-    // First create a file.
-    ESP_LOGI(SD_TAG, "Opening file");
-    FILE *config_file = fopen(MOUNT_POINT CONFIG_FILE, "r");
-    if (config_file == NULL) {
-        ESP_LOGE(SD_TAG, "Failed to config file for reading");
-        return;
-    }
-    char audio_filename[32] = MOUNT_POINT"/";
-    fgets(audio_filename + strlen(audio_filename), 32, config_file);
-    fclose(config_file);
-    ESP_LOGI(SD_TAG, "Config File Read.");
-    ESP_LOG_BUFFER_CHAR(SD_TAG, audio_filename, 32);
-
-    if (!check_mp3_suffix(audio_filename)) {
-        ESP_LOGE(SD_TAG, "Audio file defined in config missing mp3 suffix. Exiting");
-        return;
-    } else {
-        ESP_LOGI(SD_TAG, "MP3 file found");
+        ESP_LOGW(MAIN_TAG, "Failed to mount storage device. Continuing without storage...");
+        has_sd_card = false;
     }
 
     init_i2s_interface();
-    FILE *audio_file = fopen(audio_filename, "r");
+    int err = 0;
 
-    if (!audio_file) {
-        ESP_LOGE(SD_TAG, "Failed to open audio in main.");
+    TaskHandle_t audio_handle  = NULL; 
+    if (has_sd_card) {
+        FILE *config_file = fopen(MOUNT_POINT CONFIG_FILE, "r");
+        if (config_file == NULL) {
+            ESP_LOGE(MAIN_TAG, "Failed to config file for reading");
+        }
+        char audio_filename[32] = MOUNT_POINT"/";
+        fgets(audio_filename + strlen(audio_filename), 32, config_file);
+        fclose(config_file);
+        ESP_LOGI(MAIN_TAG, "Config File Read.");
+        ESP_LOG_BUFFER_CHAR(MAIN_TAG, audio_filename, 32);
+
+        if (!check_mp3_suffix(audio_filename)) {
+            ESP_LOGE(MAIN_TAG, "Audio file defined in config missing mp3 suffix. Exiting");
+        } else {
+            ESP_LOGI(MAIN_TAG, "MP3 file found");
+        }
+        err = xTaskCreate(
+                play_mp3,
+                "Play music",
+                20000,
+                &audio_filename,
+                32,
+                &audio_handle
+                );
+    }
+    else {
+        char _unused[2];
+        err = xTaskCreate(
+                sine_wave,
+                "Play music",
+                20000,
+                &_unused,
+                32,
+                &audio_handle
+                );
+
     }
 
-    fclose(audio_file);
-    TaskHandle_t xHandle = NULL; 
-    int err = xTaskCreate(
-            play_mp3,
-            "Play music",
-            20000,
-            &audio_filename,
+    printf("Setting up tasks\n");
+
+    TaskHandle_t button_handle = NULL; 
+    err = xTaskCreate(
+            check_button_input,
+            "Button checker",
+            2048,
+            &err,
             32,
-            &xHandle
+            &button_handle
             );
     printf("Err %d\n", err);
     while (1) {
         vTaskDelay(100);
     }
-    // All done, unmount partition and disable SDMMC or SPI peripheral
-    esp_vfs_fat_sdcard_unmount(mount_point, card);
-    ESP_LOGI(SD_TAG, "Card unmounted");
-
-    //deinitialize the bus after all devices are removed
-    spi_bus_free(host.slot);
 }
