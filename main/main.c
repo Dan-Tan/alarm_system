@@ -1,3 +1,5 @@
+#define configUSE_TASK_NOTIFICATIONS 1
+
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -6,6 +8,7 @@
 
 // Logging/Error includes
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 // SD card includes
@@ -16,6 +19,22 @@
 #include "freertos/projdefs.h"
 #include "sdkconfig.h"
 #include "esp_sleep.h"
+#include "hal/adc_types.h"
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+
+#include "voltage_types.h"
+#include "voltage.h"
+
+static const struct voltage_read_config_t voltage_conf = {
+    .channel = ADC_CHANNEL_6,
+    .width = ADC_WIDTH_BIT_12,
+    .atten = ADC_ATTEN_DB_12,
+    .unit = ADC_UNIT_1,
+    .div_coef = {.numerator = 2, .denominator = 1},
+    .default_vref = 3900,
+    .n_samples = 64
+};
 
 #include "driver/gpio.h"
 
@@ -23,9 +42,45 @@
 #include "audio.h"
 #include "storage.h"
 
-#define GPIO_INPUT_PIN_SEL   (1ULL << GPIO_RTC_SWITCH)
+#define GPIO_AUDIO_CONTROL   39
+
+#define GPIO_INPUT_PIN_SEL   ((1ULL << GPIO_RTC_SWITCH) | (1ULL << GPIO_AUDIO_CONTROL))
+
+#define GPIO_PERIPHERAL_POWER  18
+#define GPIO_OUTPUT_PIN_SEL (1ULL << GPIO_PERIPHERAL_POWER)
 
 const char* MAIN_TAG = "MAIN";
+
+static bool has_sd_card = true;
+static TaskHandle_t *audio_handle = NULL;
+static char audio_filename[32] = MOUNT_POINT"/";
+
+void monitor_audio_toggle(void* unused) {
+    uint32_t current_lvl = 0;
+    uint32_t prev_lvl = 0;
+    while (1) {
+        current_lvl = gpio_get_level(GPIO_AUDIO_CONTROL);
+        if ((prev_lvl == 1) && (current_lvl == 0)) {
+            if (audio_handle) {
+                xTaskNotify(*audio_handle, 0, eNoAction);
+            } else {
+                audio_handle = malloc(sizeof(TaskHandle_t));
+                xTaskCreate(
+                    has_sd_card ? play_mp3 : sine_wave,
+                    "Play music",
+                    20000,
+                    audio_filename,
+                    32,
+                    audio_handle
+                    );
+            }
+        }
+        prev_lvl = current_lvl;
+        vTaskDelay(10);
+    }
+    free(audio_handle);
+    audio_handle = NULL;
+}
 
 bool check_mp3_suffix(char* filename) {
     int counter = 0;
@@ -43,14 +98,13 @@ bool check_mp3_suffix(char* filename) {
 }
 
 void check_button_input(void* unused) {
-    printf("Entering check button\n");
     uint32_t current_lvl = 0;
     uint32_t prev_lvl = 0;
     while (1) {
         current_lvl = gpio_get_level(GPIO_RTC_SWITCH);
         if ((prev_lvl == 1) && (current_lvl == 0)) {
-            printf("Entering deep sleep\n");
             esp_sleep_enable_ext0_wakeup(GPIO_RTC_SWITCH, 1);
+            shut_down_storage();
             esp_deep_sleep_start();
         }
         prev_lvl = current_lvl;
@@ -60,24 +114,45 @@ void check_button_input(void* unused) {
 
 void app_main(void)
 {
-    gpio_config_t io_conf = {};
-    io_conf.intr_type     = GPIO_INTR_DISABLE;
-    io_conf.mode          = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask  = GPIO_INPUT_PIN_SEL;
-    io_conf.pull_down_en  = 0;
-    io_conf.pull_up_en    = 0;
+    ESP_LOGI(MAIN_TAG, "Configuring power button.");
+    gpio_config_t power_io_conf = {};
+    power_io_conf.intr_type     = GPIO_INTR_DISABLE;
+    power_io_conf.mode          = GPIO_MODE_INPUT;
+    power_io_conf.pin_bit_mask  = GPIO_INPUT_PIN_SEL;
+    power_io_conf.pull_down_en  = 0;
+    power_io_conf.pull_up_en    = 0;
+
+    gpio_config(&power_io_conf);
+
+    ESP_LOGI(MAIN_TAG, "Configuring peripheral power switch.");
+    gpio_config_t peripheral_io_conf = {};
+    peripheral_io_conf.intr_type     = GPIO_INTR_DISABLE;
+    peripheral_io_conf.mode          = GPIO_MODE_OUTPUT;
+    peripheral_io_conf.pin_bit_mask  = GPIO_OUTPUT_PIN_SEL;
+    peripheral_io_conf.pull_down_en  = 0;
+    peripheral_io_conf.pull_up_en    = 0;
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if (cause != ESP_SLEEP_WAKEUP_ULP) {
-        printf("Not ULP wakeup, initializing ULP\n");
-        init_ulp();
+        ESP_LOGI(MAIN_TAG, "Not ULP wakeup, initializing ULP");
+//        init_ulp();
     } 
 
-    gpio_config(&io_conf);
-    
+    gpio_config(&power_io_conf);
+    gpio_config(&peripheral_io_conf);
+    gpio_set_level(GPIO_PERIPHERAL_POWER, 1);
+
     esp_err_t ret;
+
+    ret = adc_config(&voltage_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Unable to configure battery voltage readings. Invalid configuration arguements.");
+    }
+    uint32_t voltage = 0;
+    read_voltage(&voltage_conf, &voltage);
+    printf("voltage: %d\n", voltage);
+
     ret = set_up_storage();
-    bool has_sd_card = true;
     if (ret != ESP_OK) {
         ESP_LOGW(MAIN_TAG, "Failed to mount storage device. Continuing without storage...");
         has_sd_card = false;
@@ -86,45 +161,16 @@ void app_main(void)
     init_i2s_interface();
     int err = 0;
 
-    TaskHandle_t audio_handle  = NULL; 
     if (has_sd_card) {
         FILE *config_file = fopen(MOUNT_POINT CONFIG_FILE, "r");
         if (config_file == NULL) {
             ESP_LOGE(MAIN_TAG, "Failed to config file for reading");
         }
-        char audio_filename[32] = MOUNT_POINT"/";
         fgets(audio_filename + strlen(audio_filename), 32, config_file);
         fclose(config_file);
         ESP_LOGI(MAIN_TAG, "Config File Read.");
         ESP_LOG_BUFFER_CHAR(MAIN_TAG, audio_filename, 32);
-
-        if (!check_mp3_suffix(audio_filename)) {
-            ESP_LOGE(MAIN_TAG, "Audio file defined in config missing mp3 suffix. Exiting");
-        } else {
-            ESP_LOGI(MAIN_TAG, "MP3 file found");
-        }
-        err = xTaskCreate(
-                play_mp3,
-                "Play music",
-                20000,
-                &audio_filename,
-                32,
-                &audio_handle
-                );
     }
-    else {
-        char _unused[2];
-        err = xTaskCreate(
-                sine_wave,
-                "Play music",
-                20000,
-                &_unused,
-                32,
-                &audio_handle
-                );
-
-    }
-
     printf("Setting up tasks\n");
 
     TaskHandle_t button_handle = NULL; 
@@ -133,11 +179,20 @@ void app_main(void)
             "Button checker",
             2048,
             &err,
-            32,
+            24,
             &button_handle
             );
-    printf("Err %d\n", err);
+    TaskHandle_t audio_toggle = NULL; 
+    err = xTaskCreate(
+            monitor_audio_toggle,
+            "Audio Toggle checker",
+            2048,
+            &err,
+            24,
+            &audio_toggle
+            );
     while (1) {
-        vTaskDelay(100);
+        vTaskDelay(1000 / portTICK_RATE_MS);
+
     }
 }

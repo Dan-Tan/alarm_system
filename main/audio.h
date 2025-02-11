@@ -4,7 +4,7 @@
 // I2S pins for amp
 #define I2S_LRC                 26    // Left Right Clock (A.K.A. WS)
 #define I2S_BCLK                25    // Bit Clock
-#define I2S_DOUT                33    // Data Out ESP32 (Data In Amp)
+#define I2S_DOUT                23    // Data Out ESP32 (Data In Amp)
 #define I2S_UNUSED              (-1)  // Not used
 
 #define I2S_PORT_NUM            (0)
