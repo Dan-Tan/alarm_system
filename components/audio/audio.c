@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #include "freertos/projdefs.h"
@@ -16,10 +17,91 @@
 
 #include "mp3dec.h"
 
+#define I2S_PORT_NUM            (0)
+#define SAMPLE_RATE             44100
+#define PI                      (3.14159265)
+#define WAVE_FREQ_HZ            (400)
+#define BIT_PER_SAMPLE          16
+
+#define AUDIO_BUFFER_SIZE       16000
+
+struct audio_source {
+    char file_path[128];
+    bool is_file;
+    SemaphoreHandle_t lock;
+};
+
 static const char *I2S_TAG = "I2S";
 static const char *AUDIO_TAG = "Audio";
 
-void init_i2s_interface() {
+enum {
+    AUD_NONE = 0,
+    AUD_PLAY,
+    AUD_PAUSE,
+    AUD_SWAP,
+    AUD_STOP,
+};
+
+static struct audio_source SOURCE = {
+    .file_path = "",
+    .is_file = false
+};
+
+static bool _IS_PAUSED = false;
+static bool _IS_STOPPED = true;
+
+static TaskHandle_t AUDIO_HANDLE = NULL;
+
+void aud_main(void* unused);
+
+/**
+ * Return true if a loaded audio source should exit.
+ * False if an audio source currently playing, should not exit
+ */
+bool _handle_messages() {
+    uint32_t ret = ulTaskNotifyTake(pdTRUE, 0);
+    switch (ret) {
+        case AUD_NONE:
+            break;
+        case AUD_PLAY:
+            i2s_start(I2S_PORT_NUM);
+            _IS_PAUSED = false; break;
+            return false;
+        case AUD_PAUSE:
+            i2s_stop(I2S_PORT_NUM);
+            _IS_PAUSED = true; break;
+            return false;
+        case AUD_SWAP:
+            i2s_stop(I2S_PORT_NUM);
+            i2s_zero_dma_buffer(I2S_PORT_NUM);
+            _IS_PAUSED = false;
+            _IS_STOPPED = false;
+            return true;
+        case AUD_STOP:
+            i2s_stop(I2S_PORT_NUM);
+            i2s_zero_dma_buffer(I2S_PORT_NUM);
+            _IS_PAUSED = false;
+            _IS_STOPPED = true;
+            return true;
+    };
+    return false;
+}
+
+bool _handle_controls() {
+    while (1) {
+        bool to_exit = _handle_messages();
+        if (to_exit) {
+            return true;
+        }
+        else if (!_IS_PAUSED) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));    
+    }
+    return false;
+}
+
+aud_err_t aud_init(const struct aud_i2s_config_t *config) {
     esp_err_t ret;
     i2s_config_t i2s_config = {
         .mode = I2S_MODE_MASTER | I2S_MODE_TX,  // Control and Transmit
@@ -37,35 +119,38 @@ void init_i2s_interface() {
         ESP_LOGI(I2S_TAG, "Successfully installed i2s driver.");
     } else if (ret == ESP_ERR_INVALID_ARG) {
         ESP_LOGE(I2S_TAG, "Invalid Argument in i2s driver install");
-        return;
+        return AUD_FAIL;
     } else if (ret == ESP_ERR_NO_MEM) {
         ESP_LOGE(I2S_TAG, "Out of Memory: Unable to install i2s driver.");
-        return;
+        return AUD_FAIL;
     } else {
         ESP_LOGE(I2S_TAG, "Unknown error return in i2s driver install.");
-        return;
+        return AUD_FAIL;
     }
 
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCLK,
-        .ws_io_num = I2S_LRC,
-        .data_out_num = I2S_DOUT,
-        .data_in_num = I2S_PIN_NO_CHANGE
+        .bck_io_num = config->bclk_gpio,
+        .ws_io_num = config->lrc_gpio,
+        .data_out_num = config->dout_gpio,
+        .data_in_num = config->din_gpio
     };
 
     ESP_LOGI(I2S_TAG, "Setting Pin Configuration.");
     ret = i2s_set_pin(I2S_PORT_NUM, &pin_config);
     if (ret == ESP_OK) {
         ESP_LOGI(I2S_TAG, "Successfully set i2s pin coniguration.");
+        vSemaphoreCreateBinary(SOURCE.lock);
+        ret = xTaskCreate(aud_main, "Audio Main", 2048, NULL, 32, &AUDIO_HANDLE);
+        return AUD_OKAY;
     } else if (ret == ESP_ERR_INVALID_ARG) {
         ESP_LOGE(I2S_TAG, "Invalid Argument in setting i2s pin configuration.");
-        return;
+        return AUD_FAIL;
     } else if (ret == ESP_FAIL) {
         ESP_LOGE(I2S_TAG, "IO Error in setting i2s pin configuration.");
-        return;
+        return AUD_FAIL;
     } else {
         ESP_LOGE(I2S_TAG, "Unknown error return in setting i2s pin configuration.");
-        return;
+        return AUD_FAIL;
     }
 };
 
@@ -83,28 +168,20 @@ void mono_to_stereo(short* out, int n_samples) {
 }
 
 
-void sine_wave(void* unused) {
+void sine_wave() {
     printf("Playing Sine Wave\n");
-    bool paused = false;
     short *output_buffer = malloc(8 * 4410 * sizeof(short));
+    if (!output_buffer) {
+        ESP_LOGE(AUDIO_TAG, "Input Buffer failed to allocate.");
+        return;
+    }
     size_t i2s_bytes_written = 0;
     int j = 0;
     i2s_set_clk(I2S_PORT_NUM, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+    i2s_start(I2S_PORT_NUM);
     while (1) {
-        if (!paused) {
-            paused = pdPASS == xTaskNotifyWait(0, ULONG_MAX, NULL, 0);
-            if (paused) {
-                i2s_stop(I2S_PORT_NUM);
-                continue;
-            }
-        } else {
-            uint32_t ret = xTaskNotifyWait(0, ULONG_MAX, NULL, pdMS_TO_TICKS(100));
-            paused = !(ret == pdPASS);
-            if (!paused) {
-                i2s_start(I2S_PORT_NUM);
-            } else {
-            continue;
-            }
+        if (_handle_controls()) {
+            break;
         }
         for (int i = 1; i < 4 * 4410; i++) {
             output_buffer[2 * i] = (short)(sin(PI * (float) (2 * 441 * j) / (float) SAMPLE_RATE) * (float) 0x00ff);
@@ -115,6 +192,7 @@ void sine_wave(void* unused) {
         i2s_write(I2S_PORT_NUM, output_buffer, 8 * 4410 * sizeof(short), &i2s_bytes_written, portMAX_DELAY);
         vTaskDelay(1);
     }
+    free(output_buffer);
 }
 
 void log_mp3_err_ret(int ret, bool frame) {
@@ -215,23 +293,18 @@ int decode_n_frames(
         samples_decoded += frame_info->outputSamps;
         ++i;
     }
-    ESP_LOGI(AUDIO_TAG, "Exiting, decoded n_frames.");
-    printf("Decoded: %d frames", samples_decoded);
     return samples_decoded;
 }
 
-void play_mp3(void *filepath_v) {
+void play_mp3(const void *filepath_v) {
     const char* filepath = (char*) filepath_v;
     
     HMP3Decoder mp3d = MP3InitDecoder();
 
     FILE *audio_file = fopen(filepath, "r");
     unsigned char *input_buffer = malloc(AUDIO_BUFFER_SIZE * sizeof(unsigned char));
-    short *output_buffer = malloc(10 * 1100 * sizeof(short));
-    bool paused = false;
+    short *output_buffer = malloc(10 * 2304 * sizeof(short));
 
-    printf("Input Buffer Size: %d\n", AUDIO_BUFFER_SIZE);
-    printf("Output Buffer Size: %d\n", 10 * 1100);
     if (!audio_file) {
         ESP_LOGE(AUDIO_TAG, "Failed to open audio file.");
     }
@@ -254,23 +327,11 @@ void play_mp3(void *filepath_v) {
     i2s_set_clk(I2S_PORT_NUM, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
     
     bool unfinished_file = true;
+    i2s_start(I2S_PORT_NUM);
     while (unfinished_file) {
-        if (!paused) {
-            paused = pdPASS == xTaskNotifyWait(0, ULONG_MAX, NULL, 0);
-            if (paused) {
-                i2s_stop(I2S_PORT_NUM);
-                continue;
-            }
-        } else {
-            uint32_t ret = xTaskNotifyWait(0, ULONG_MAX, NULL, pdMS_TO_TICKS(100));
-            paused = !(ret == pdPASS);
-            if (!paused) {
-                i2s_start(I2S_PORT_NUM);
-            } else {
-            continue;
-            }
+        if (_handle_controls()) {
+            break;
         }
-        printf("bytes_to_read: %d, input_buffer_size: %d\n", (int)bytes_to_read, input_buffer_size);
         unsigned long bytes_read = fread(input_buffer + input_buffer_size, 
                                          sizeof(char), 
                                          bytes_to_read, 
@@ -297,6 +358,7 @@ void play_mp3(void *filepath_v) {
         input_buffer_size += bytes_read;
 
         if (input_buffer_size == 0) {
+            _IS_STOPPED = true;
             break;
         }
 
@@ -321,14 +383,8 @@ void play_mp3(void *filepath_v) {
         memmove(input_buffer, input_buffer + AUDIO_BUFFER_SIZE - input_buffer_size, input_buffer_size);
 
         i2s_write(I2S_PORT_NUM, output_buffer, samples_decoded * sizeof(short), &i2s_bytes_written, portMAX_DELAY);
-        if (samples_decoded * sizeof(short) > i2s_bytes_written) {
-            //printf("Decoded: %d, Written: %u\n", (int) (samples_decoded * sizeof(short)), i2s_bytes_written);
-        }
         vTaskDelay(pdMS_TO_TICKS(5));
     };
-    if (audio_file == NULL) {
-        ESP_LOGI(AUDIO_TAG, "Cleaning mp3 decoder.");
-    }
     // Clean up
     ESP_LOGI(AUDIO_TAG, "Cleaning mp3 decoder.");
     MP3FreeDecoder(mp3d);
@@ -338,6 +394,133 @@ void play_mp3(void *filepath_v) {
     fclose(audio_file);
     ESP_LOGI(AUDIO_TAG, "Cleaning output buffer.");
     free(output_buffer);
-    vTaskDelete( NULL );
+}
+aud_err_t aud_play_mp3(char* filepath) {
+    ESP_LOGI(AUDIO_TAG, "Notifying audio task to switch to playing mp3 file.");
+    // Obtain the lock to prevent the audio loop from reading audio source before it haqs been written.
+    if (xSemaphoreTake(SOURCE.lock, 0)) {
+        eTaskState state = eTaskGetState(AUDIO_HANDLE);
+        uint32_t ret = pdPASS;
+        if (state != eSuspended) {
+            ret = xTaskNotify(AUDIO_HANDLE, AUD_SWAP, eSetValueWithoutOverwrite);
+        }
+        else {
+            vTaskResume(AUDIO_HANDLE);
+        }
+        if (ret == pdPASS) {
+            ESP_LOGI(AUDIO_TAG, "Switching to playing mp3 file.");
+            SOURCE.is_file = true;
+            strcpy(SOURCE.file_path, filepath);
+            xSemaphoreGive(SOURCE.lock);
+            return AUD_OKAY;
+        }
+        else {
+            ESP_LOGI(AUDIO_TAG, "Failed to send play mp3 notification. The previous message may not have been accepted");
+            xSemaphoreGive(SOURCE.lock);
+            return AUD_FAIL;
+        }
+    } else {
+        ESP_LOGI(AUDIO_TAG, "Failed to obtain audio source lock.");
+        return AUD_FAIL;
+    }
+}
+aud_err_t aud_play_sine(uint32_t freq) {
+    ESP_LOGI(AUDIO_TAG, "Notifying audio task to switch to playing sine wave");
+    if (xSemaphoreTake(SOURCE.lock, 0)) {
+        eTaskState state = eTaskGetState(AUDIO_HANDLE);
+        uint32_t ret = pdPASS;
+        if (state != eSuspended) {
+            ret = xTaskNotify(AUDIO_HANDLE, AUD_SWAP, eSetValueWithoutOverwrite);
+        }
+        else {
+            vTaskResume(AUDIO_HANDLE);
+        }
+        if (ret == pdPASS) {
+            ESP_LOGI(AUDIO_TAG, "Switching to playing sine wave.");
+            SOURCE.is_file = false;
+            SOURCE.file_path[0] = '\0';
+            xSemaphoreGive(SOURCE.lock);
+            return AUD_OKAY;
+        }
+        else {
+            ESP_LOGI(AUDIO_TAG, "Failed to send play sine notification. The previous message may not have been accepted");
+            xSemaphoreGive(SOURCE.lock);
+            return AUD_FAIL;
+        }
+    } else {
+        ESP_LOGI(AUDIO_TAG, "Failed to obtain audio source lock.");
+        return AUD_FAIL;
+    }
 }
 
+aud_err_t aud_pause() {
+    ESP_LOGI(AUDIO_TAG, "Sending pause notification.");
+    uint32_t ret = xTaskNotify(AUDIO_HANDLE, AUD_PAUSE, eSetValueWithoutOverwrite);
+    if (ret == pdPASS) {
+        ESP_LOGI(AUDIO_TAG, "Sending pause notification successful.");
+        return AUD_OKAY;
+    }
+    else {
+        ESP_LOGI(AUDIO_TAG, "Failed to send pause notification. The previous message may not have been accepted");
+        return AUD_FAIL;
+    }
+}
+
+
+aud_err_t aud_resume() {
+    ESP_LOGI(AUDIO_TAG, "Sending resume notification.");
+    uint32_t ret = xTaskNotify(AUDIO_HANDLE, AUD_PLAY, eSetValueWithoutOverwrite);
+    if (ret == pdPASS) {
+        ESP_LOGI(AUDIO_TAG, "Sending resume notification successful.");
+        return AUD_OKAY;
+    }
+    else {
+        ESP_LOGI(AUDIO_TAG, "Failed to send resume notification. The previous message may not have been accepted");
+        return AUD_FAIL;
+    }
+}
+
+aud_err_t aud_stop() {
+    ESP_LOGI(AUDIO_TAG, "Sending stop notification to audio task.");
+    uint32_t ret = xTaskNotify(AUDIO_HANDLE, AUD_STOP, eSetValueWithoutOverwrite);
+    if (ret == pdPASS) {
+        ESP_LOGI(AUDIO_TAG, "Sending stop notification successful.");
+        return AUD_OKAY;
+    }
+    else {
+        ESP_LOGI(AUDIO_TAG, "Failed to send stop notification. The previous message may not have been accepted");
+        return AUD_FAIL;
+    }
+}
+
+void aud_main(void *unused) {
+
+    while (1) {
+        heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true);
+        _handle_controls();
+
+        if (_IS_STOPPED) {
+            vTaskSuspend(NULL);
+        }
+        const char* file_path = NULL;
+        bool is_file = false;
+
+        if (xSemaphoreTake(SOURCE.lock, pdMS_TO_TICKS(1000))) {
+            file_path = SOURCE.file_path;
+            is_file = SOURCE.is_file;
+            xSemaphoreGive(SOURCE.lock);
+        } 
+        else {
+             ESP_LOGW(AUDIO_TAG, "Failed to obtain audio source lock. Suspending.");
+             vTaskSuspend(NULL);
+        }
+
+        if (is_file) {
+            play_mp3(file_path);
+        } 
+        else {
+        ESP_LOGI(AUDIO_TAG, "main Leftover mem: %d", (int) heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+            sine_wave();
+        }
+    }
+}

@@ -1,5 +1,3 @@
-#define configUSE_TASK_NOTIFICATIONS 1
-
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -23,8 +21,17 @@
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 
+#include "audio.h"
+
 #include "voltage_types.h"
 #include "voltage.h"
+
+static const struct aud_i2s_config_t audio_conf = {
+    .lrc_gpio = 26,
+    .bclk_gpio = 25,
+    .dout_gpio = 23,
+    .din_gpio = (-1)
+};
 
 static const struct voltage_read_config_t voltage_conf = {
     .channel = ADC_CHANNEL_6,
@@ -51,29 +58,50 @@ static const struct voltage_read_config_t voltage_conf = {
 
 const char* MAIN_TAG = "MAIN";
 
-static bool has_sd_card = true;
+static bool has_sd_card           = true;
+static bool alarm_played          = false;
 static TaskHandle_t *audio_handle = NULL;
-static char audio_filename[32] = MOUNT_POINT"/";
 
-void monitor_audio_toggle(void* unused) {
+enum {
+    PLAYING = 0,
+    PAUSED,
+    NOT_PLAYING,
+    UNKNOWN
+};
+
+void monitor_audio_toggle(void* filename) {
     uint32_t current_lvl = 0;
     uint32_t prev_lvl = 0;
+    uint32_t audio_state = UNKNOWN;
+
+    uint32_t count = 0;
     while (1) {
         current_lvl = gpio_get_level(GPIO_AUDIO_CONTROL);
         if ((prev_lvl == 1) && (current_lvl == 0)) {
-            if (audio_handle) {
-                xTaskNotify(*audio_handle, 0, eNoAction);
-            } else {
-                audio_handle = malloc(sizeof(TaskHandle_t));
-                xTaskCreate(
-                    has_sd_card ? play_mp3 : sine_wave,
-                    "Play music",
-                    20000,
-                    audio_filename,
-                    32,
-                    audio_handle
-                    );
+            switch (count % 7) {
+                case 0:
+                    aud_play_sine(1);
+                    break;
+                case 1:
+                    aud_pause();
+                    break;
+                case 2:
+                    aud_resume();
+                    break;
+                case 3:
+                    aud_play_mp3(filename);
+                    break;
+                case 4:
+                    aud_pause();
+                    break;
+                case 5:
+                    aud_resume();
+                    break;
+                case 6:
+                    aud_stop();
+                    break;
             }
+            count++;
         }
         prev_lvl = current_lvl;
         vTaskDelay(10);
@@ -103,6 +131,7 @@ void check_button_input(void* unused) {
     while (1) {
         current_lvl = gpio_get_level(GPIO_RTC_SWITCH);
         if ((prev_lvl == 1) && (current_lvl == 0)) {
+            free(audio_handle);
             esp_sleep_enable_ext0_wakeup(GPIO_RTC_SWITCH, 1);
             shut_down_storage();
             esp_deep_sleep_start();
@@ -158,8 +187,13 @@ void app_main(void)
         has_sd_card = false;
     }
 
-    init_i2s_interface();
+    aud_err_t aud_err = aud_init(&audio_conf);
+    if (aud_err != AUD_OKAY) {
+        ESP_LOGW(MAIN_TAG, "Failed to setup audio interface.");
+    }
     int err = 0;
+    char* audio_filename = (char*) calloc(32, sizeof(char));
+    strcpy(audio_filename, MOUNT_POINT"/");
 
     if (has_sd_card) {
         FILE *config_file = fopen(MOUNT_POINT CONFIG_FILE, "r");
@@ -171,8 +205,9 @@ void app_main(void)
         ESP_LOGI(MAIN_TAG, "Config File Read.");
         ESP_LOG_BUFFER_CHAR(MAIN_TAG, audio_filename, 32);
     }
-    printf("Setting up tasks\n");
+    audio_handle = malloc(sizeof(TaskHandle_t));
 
+    ESP_LOGI(MAIN_TAG, "Starting deep sleep button listener.");
     TaskHandle_t button_handle = NULL; 
     err = xTaskCreate(
             check_button_input,
@@ -182,17 +217,17 @@ void app_main(void)
             24,
             &button_handle
             );
+    ESP_LOGI(MAIN_TAG, "Starting audio button listener.");
     TaskHandle_t audio_toggle = NULL; 
     err = xTaskCreate(
             monitor_audio_toggle,
             "Audio Toggle checker",
             2048,
-            &err,
+            audio_filename,
             24,
             &audio_toggle
             );
     while (1) {
         vTaskDelay(1000 / portTICK_RATE_MS);
-
     }
 }
