@@ -26,6 +26,8 @@
 #include "voltage_types.h"
 #include "voltage.h"
 
+#include "wifi_controller.h"
+
 static const struct aud_i2s_config_t audio_conf = {
     .lrc_gpio = 26,
     .bclk_gpio = 25,
@@ -195,6 +197,9 @@ void app_main(void)
     char* audio_filename = (char*) calloc(32, sizeof(char));
     strcpy(audio_filename, MOUNT_POINT"/");
 
+    char *ssid = NULL;
+    char *password = NULL;
+
     if (has_sd_card) {
         FILE *config_file = fopen(MOUNT_POINT CONFIG_FILE, "r");
         if (config_file == NULL) {
@@ -202,9 +207,19 @@ void app_main(void)
         }
         fgets(audio_filename + strlen(audio_filename), 32, config_file);
         fclose(config_file);
+        
+        esp_err_t err = get_ap_credentials(MOUNT_POINT CONFIG_FILE, &ssid, &password);
+
+        if (!err == ESP_OK) {
+            ESP_LOGE(MAIN_TAG, "Failed to extract AP credentials.");
+            free(ssid);
+            free(password);
+        };
         ESP_LOGI(MAIN_TAG, "Config File Read.");
         ESP_LOG_BUFFER_CHAR(MAIN_TAG, audio_filename, 32);
     }
+
+    wc_start_webserver(ssid, password);
     audio_handle = malloc(sizeof(TaskHandle_t));
 
     ESP_LOGI(MAIN_TAG, "Starting deep sleep button listener.");

@@ -1,6 +1,8 @@
 #ifndef _STORAGE_H
 #define _STORAGE_H
 
+#include "esp_err.h"
+
 #define MOUNT_POINT            "/sd"
 
 #define CONFIG_FILE            "/config.txt"
@@ -13,6 +15,9 @@
 #define SPI_DMA_CHAN            host->slot
 
 esp_err_t set_up_storage();
+
 void shut_down_storage();
+
+esp_err_t get_ap_credentials(const char* config_filepath, char **ssid, char **password);
 
 #endif
